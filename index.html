@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8" />
+    <title>WASM XOR | WebGPU profiler</title>
+
+    <script>
+        var fn_generate_random_bytes = null;
+        var fn_vec_xor = null;
+    </script>
+  </head>
+  <body>
+    
+    <script type="module">
+      import init, { generate_random_bytes, vec_xor } from "./pkg/wasm_byte_xor.js";
+      init().then(() => {
+        console.log("loaded_wasm");
+        fn_generate_random_bytes = generate_random_bytes;
+        fn_vec_xor = vec_xor;
+      });
+    </script>
+
+    <script>
+      const gpuCode = async () => {
+        const adapter = await navigator.gpu.requestAdapter();
+        console.log(adapter);
+        if (!adapter) return;
+        const device = await adapter.requestDevice();
+      }
+      
+    </script>
+
+  </body>
+</html>
