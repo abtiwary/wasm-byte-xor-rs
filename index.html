@@ -7,6 +7,9 @@
     <script>
         var fn_generate_random_bytes = null;
         var fn_vec_xor = null;
+
+        var adapter = null;
+        var device = null;
     </script>
   </head>
   <body>
@@ -14,20 +17,206 @@
     <script type="module">
       import init, { generate_random_bytes, vec_xor } from "./pkg/wasm_byte_xor.js";
       init().then(() => {
-        console.log("loaded_wasm");
         fn_generate_random_bytes = generate_random_bytes;
         fn_vec_xor = vec_xor;
+        console.log("loaded wasm");
       });
     </script>
 
     <script>
-      const gpuCode = async () => {
-        const adapter = await navigator.gpu.requestAdapter();
-        console.log(adapter);
+      const gpuInit = async () => {
+        adapter = await navigator.gpu.requestAdapter();
+        //console.log(adapter);
         if (!adapter) return;
-        const device = await adapter.requestDevice();
+        device = await adapter.requestDevice();
+
+        console.log(device.limits.maxComputeWorkgroupsPerDimension);
+        console.log(device.limits.maxComputeWorkgroupSizeX);
+        
+        //const maxComputeSizeX = device.limits.maxComputeSizeX;
+
+        //gpuByteArrayXOR(1024);
+      }
+
+      const gpuByteArrayXOR = async (arrSize) => {
+
+        let firstArray = new Uint32Array(arrSize+1);
+        firstArray.set([arrSize, ...fn_generate_random_bytes(arrSize)]);
+        let gpuBufferFirstArray = device.createBuffer({
+          mappedAtCreation: true,
+          size: firstArray.byteLength,
+          usage: GPUBufferUsage.STORAGE,
+        });
+        console.log(firstArray);
+      
+        let arrayBufferFirst = gpuBufferFirstArray.getMappedRange();
+        new Uint32Array(arrayBufferFirst).set(firstArray);
+        gpuBufferFirstArray.unmap();
+
+        let secondArray = new Uint32Array(arrSize+1);
+        secondArray.set([arrSize, ...fn_generate_random_bytes(arrSize)]);
+        let gpuBufferSecondArray = device.createBuffer({
+          mappedAtCreation: true,
+          size: secondArray.byteLength,
+          usage: GPUBufferUsage.STORAGE,
+        });
+        console.log(secondArray);
+      
+        let arrayBufferSecond = gpuBufferSecondArray.getMappedRange();
+        new Uint32Array(arrayBufferSecond).set(secondArray);
+        gpuBufferSecondArray.unmap();
+
+        let resultArrayLength = Uint32Array.BYTES_PER_ELEMENT * (1 + firstArray.length);
+        let resultArray = device.createBuffer({
+          size: resultArrayLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+
+        const bindGroupLayout = device.createBindGroupLayout({
+          entries: [
+            {
+              binding: 0,
+              visibility: GPUShaderStage.COMPUTE,
+              buffer: {
+                type: "read-only-storage"
+              }
+            },
+            {
+              binding: 1,
+              visibility: GPUShaderStage.COMPUTE,
+              buffer: {
+                type: "read-only-storage"
+              }
+            },
+            {
+              binding: 2,
+              visibility: GPUShaderStage.COMPUTE,
+              buffer: {
+                type: "storage"
+              }
+            }
+          ]
+        });
+
+        const bindGroup = device.createBindGroup({
+          layout: bindGroupLayout,
+          entries: [
+            {
+              binding: 0,
+              resource: {
+                buffer: gpuBufferFirstArray
+              }
+            },
+            {
+              binding: 1,
+              resource: {
+                buffer: gpuBufferSecondArray
+              }
+            },
+            {
+              binding: 2,
+              resource: {
+                buffer: resultArray
+              }
+            }
+          ]
+        });
+        
+        const maxComputeSizeX = device.limits.maxComputeWorkgroupSizeX;
+
+        const compute_shader_code = `
+        struct Array {
+              size: u32,
+              bytes: array<u32>,
+            }
+
+            @group(0) @binding(0) var<storage, read> firstArray : Array;
+            @group(0) @binding(1) var<storage, read> secondArray : Array;
+            @group(0) @binding(2) var<storage, read_write> resultArray : Array;
+
+            @compute @workgroup_size(${maxComputeSizeX}, 1)
+            fn main(@builtin(global_invocation_id) global_id : vec3u) {
+              if (global_id.x >= u32(firstArray.size) || global_id.x >= u32(secondArray.size)) {
+                return;
+              }
+
+              resultArray.size = firstArray.size;
+
+              let result_idx = global_id.x;
+              resultArray.bytes[result_idx] = firstArray.bytes[result_idx] ^ secondArray.bytes[result_idx];
+            }
+        `
+
+        const shaderModule = device.createShaderModule({
+          code: compute_shader_code          
+        });
+
+        const computePipeline = device.createComputePipeline({
+          layout: device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout]
+          }),
+          compute: {
+            module: shaderModule,
+            entryPoint: "main"
+          }
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(computePipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        const workgroupCountX = Math.ceil(firstArray.length / 8);
+        //const workgroupCountY = Math.ceil(secondArray.length / 8);
+        const workgroupCountY = 1;
+        //passEncoder.dispatchWorkgroups(workgroupCountX, workgroupCountY);
+        passEncoder.dispatchWorkgroups(workgroupCountX, workgroupCountY);
+        passEncoder.end();
+        
+        const gpuReadBuffer = device.createBuffer({
+          size: resultArrayLength,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+
+        commandEncoder.copyBufferToBuffer(
+          resultArray,
+          0,
+          gpuReadBuffer,
+          0,
+          resultArrayLength
+        );
+
+        const gpuCommands = commandEncoder.finish();
+
+        let t0 = performance.now();
+        device.queue.submit([gpuCommands]);
+
+        await gpuReadBuffer.mapAsync(GPUMapMode.READ);
+        const arrayBuffer = gpuReadBuffer.getMappedRange();
+
+        let t1 = performance.now();
+
+        console.log(`${t1 - t0} milliseconds`);
+
+        console.log(new Uint32Array(arrayBuffer));
+        console.log("\n\n\n\n");
+
+        let firstArrayAsUint8 = new Uint8Array(firstArray.length);
+        firstArrayAsUint8.set([...firstArray]);
+        let secondArrayAsUint8 = new Uint8Array(secondArray.length);
+        secondArrayAsUint8.set([...secondArray]);
+        console.log(firstArrayAsUint8);
+        console.log(secondArrayAsUint8);
+        let t3 = performance.now();
+        fn_vec_xor(firstArrayAsUint8, secondArrayAsUint8);
+        let t4 = performance.now();
+        console.log(`${t4 - t3} milliseconds`);
+
+        console.log(new Uint32Array(firstArrayAsUint8));
+
       }
       
+      document.onload = gpuInit();
     </script>
 
   </body>
